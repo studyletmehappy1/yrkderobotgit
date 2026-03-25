@@ -5,6 +5,58 @@ ASR 语音识别模块 (耳朵)
 """
 
 import speech_recognition as sr
+import requests
+import json
+
+# ================= 百度短语音识别 API 配置 =================
+# 请前往百度智能云 (console.bce.baidu.com) -> 产品服务 -> 语音技术 -> 创建应用
+# 在应用列表可以获取以下两个 Key。个人认证每日免费额度足够普通测试。
+BAIDU_API_KEY = "填写你的_API_KEY_在这里"
+BAIDU_SECRET_KEY = "填写你的_SECRET_KEY_在这里"
+
+def recognize_baidu(audio):
+    """调用百度短语音识别 REST API (纯PCM直传版本)"""
+    if BAIDU_API_KEY.startswith("填写你的"):
+        print("[耳朵] ❌ 请先在 ars_api.py 顶部填入你的百度 API_KEY 和 SECRET_KEY")
+        return ""
+
+    # 第一步：获取针对当前会话的 Access Token
+    token_url = f"https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials&client_id={BAIDU_API_KEY}&client_secret={BAIDU_SECRET_KEY}"
+    try:
+        token_response = requests.post(token_url, headers={'Content-Type': 'application/json'}, timeout=5)
+        token = token_response.json().get("access_token", "")
+        if not token:
+            print(f"[耳朵] ❌ 获取百度鉴权Token失败，请检查 Key 是否正确，或是否开通了语音技术服务。")
+            return ""
+    except Exception as e:
+        print(f"[耳朵] ❌ 请求百度鉴权接口网络异常: {e}")
+        return ""
+
+    # 第二步：将语音转码发给百度 ASR 识别服务器
+    # dev_pid=1537 代表普通话输入
+    asr_url = f"http://vop.baidu.com/server_api?dev_pid=1537&cuid=my_smart_home&token={token}"
+    
+    # 将录音数据转换为百度强制要求的标准格式数据：16kHz采样率, 16bit位深, 单声道, PCM编码
+    pcm_data = audio.get_raw_data(convert_rate=16000, convert_width=2)
+    
+    headers = {
+        'Content-Type': 'audio/pcm;rate=16000',
+        'Accept': 'application/json'
+    }
+    
+    try:
+        asr_response = requests.post(asr_url, headers=headers, data=pcm_data, timeout=10)
+        result = asr_response.json()
+        
+        # 返回 JSON 中 err_no 为 0 代表识别成功
+        if result.get("err_no") == 0:
+            return result.get("result", [""])[0] 
+        else:
+            print(f"[耳朵] ❌ 百度识别出错 (错误码:{result.get('err_no')}): {result.get('err_msg')}")
+            return ""
+    except Exception as e:
+        print(f"[耳朵] ❌ 请求百度ASR接口网络异常: {e}")
+        return ""
 
 def listen_and_recognize():
     """
@@ -29,11 +81,27 @@ def listen_and_recognize():
             
             print("[耳朵] ⏳ 录音结束，正在请求云端翻译...")
             
-            # 调用内置的纯免费 Google Web API (识别语言设置为简体中文)
-            text = recognizer.recognize_google(audio, language='zh-CN')
-            print(f"[耳朵] ✅ 听懂了: {text}")
+            text = ""
             
-            return text
+            # 策略：双端降级容灾机制
+            # 优先尝试免费且带强力自适应的 Google API (需要网络环境允许)
+            try:
+                print("[耳朵] 正在尝试连接 Google ASR...")
+                text = recognizer.recognize_google(audio, language='zh-CN')
+            except Exception as e:
+                print(f"[耳朵] ⚠️ Google API 访问失败 ({e})，立即切换至百度国内通道...")
+                text = ""
+            
+            # 如果 Google 失败或者返回空，作为备用退线路由，启用百度 ASR
+            if not text:
+                print("[耳朵] 正在使用百度 ASR 兜底识别...")
+                text = recognize_baidu(audio)
+            
+            if text:
+                print(f"[耳朵] ✅ 听懂了: {text}")
+                return text
+            else:
+                return ""
             
         except sr.WaitTimeoutError:
             print("[耳朵] ⚠️ 等了半天没听到声音哦。")
