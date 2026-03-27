@@ -1,14 +1,3 @@
----
-AIGC:
-    ContentProducer: Minimax Agent AI
-    ContentPropagator: Minimax Agent AI
-    Label: AIGC
-    ProduceID: c3a2d94cd0287dd301197c6db7af0ed2
-    PropagateID: c3a2d94cd0287dd301197c6db7af0ed2
-    ReservedCode1: 3046022100a1b06159e97c6ec38f06ad3315756bb13c5fb33d3c6bf5f9cad4c4188cb501b60221009a3d28992541ec7a7e6e2a9d9982dd2965187200cbc791727a620b7ab3a9d1d2
-    ReservedCode2: 3046022100c26afb44609f537fda06b3aec454f6a86fb9e773001319072677259ef5d6df14022100fe18073cc4d3f61b1f6657590595ab59da92af9a7533d9eafc9c4eb0603cc426
----
-
 # 宇树机器人智能陪伴系统 PRD 文档
 
 ## 文档信息
