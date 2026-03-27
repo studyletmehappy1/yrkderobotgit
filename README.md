@@ -8,7 +8,7 @@
 | 文档日期 | 2026年3月27日                 |
 | 文档作者 | **YRK** 联合团队      |
 | 项目仓库 | https://github.com/studyletmehappy1/yrkderobotgit |
-
+| 指导老师 | minmax+Gemini |
 ---
 
 ## 一、产品概述
