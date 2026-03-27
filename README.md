@@ -100,18 +100,37 @@
 | 服务商 | 产品名称 | 官方链接 | 特点 | 适用场景 |
 |--------|----------|----------|------|----------|
 | 阿里云 | 语音识别ASR | https://www.aliyun.com/product/ivr | 中文识别领先，支持方言，提供实时语音识别和录音文件识别两种服务模式 | 国内项目首选，中文场景效果最佳 |
-| 讯飞 | 语音识别 | https://www.xfyun.cn/services/ASR | 多语种支持优秀，垂类场景模型丰富，准确率高 | 多语言需求、高精度要求场景 |
-| 百度智能云 | 语音识别 | https://cloud.baidu.com/product/speech.html | 实时性好，支持多种音频格式，提供离线识别能力 | 实时对话场景、需要离线能力场景 |
 | OpenAI | Whisper API | https://platform.openai.com/docs/guides/speech-to-text | 开源模型，支持多语言，API调用简便 | 海外项目、多语言混合场景 |
-| 腾讯云 | 语音识别 ASR | https://cloud.tencent.com/product/asr | 集成微信生态，支持实时和录音识别 | 已有腾讯云资源、需要微信集成的项目 |
 
 **语音合成（TTS）服务商推荐**
 
 | 服务商 | 产品名称 | 官方链接 | 特点 | 适用场景 |
 |--------|----------|----------|------|----------|
 | 阿里云 | 语音合成TTS | https://www.aliyun.com/product/mn/ps | 多种音色可选，支持情感合成，的声音自然度高 | 国内项目首选，品牌音色丰富 |
-| 讯飞 | 语音合成 | https://www.xfyun.cn/services/tts | 情感合成技术领先，支持变调和停顿调节 | 情感交互场景、有声内容生成 |
-| 百度智能云 | 语音合成 | https://cloud.baidu.com/product/speech.html | 支持多种发音人，提供SSML标签控制 | 需要精细控制的场景 |
+|  服务 | 官方链接 | 特点 | 适用场景 |
+|------|----------|------|----------|
+| MiniMax ASR | https://www.minimaxi.com/document/speech-to-text | 中文识别领先，支持实时语音转文本，提供多语言和多方言支持 | 家庭陪伴机器人语音输入 |
+
+**MiniMax TTS 语音合成 API**
+
+| 服务 | 官方链接 | 特点 | 适用场景 |
+|------|----------|------|----------|
+| MiniMax TTS | https://www.minimaxi.com/document/text-to-speech | 多音色可选，支持情感合成，的声音自然度高，支持声音克隆 | 机器人语音输出、儿童故事朗读 |
+
+**MiniMax 大语言模型 API（Speed）**
+
+| 服务 | 官方链接 | 特点 | 适用场景 |
+|------|----------|------|----------|
+| MiniMax Speed | https://www.minimaxi.com/document/speed | 高速推理能力，低延迟响应，支持上下文理解，多轮对话能力强 | 智能对话、任务理解、动作编排 |
+
+**MiniMax LLM API（abab）**
+
+|------|----------|------|----------|
+| MiniMax abab | https://www.minimaxi.com/document/ChatCompletion | 超大上下文窗口，强大的语义理解能力，支持函数调用和插件扩展 | 复杂任务处理、多轮对话 |
+
+| MiniMax | VAD服务 | https://www.minimaxi.com/ | 与ASR/TTS一体化设计，低延迟，高准确率 | 与MiniMax ASR/TTS配套使用 |
+| SpeechBrain | Open Source VAD | https://github.com/speechbrain/speechbrain | 开源免费，支持自定义训练 | 成本敏感、有技术能力定制优化 |
+| Silero | Silero VAD | https://github.com/silero-vad/silero-vad | 轻量级，高准确率，完全免费开源 | 边缘部署、性能敏感场景 |
 | Azure | Azure TTS | https://azure.microsoft.com/services/cognitive-services/text-to-speech/ | Neural TTS声音自然，支持自定义声音 | 海外项目、高质量要求场景 |
 | ElevenLabs | AI Voice API | https://elevenlabs.io/api | AI声音克隆，支持自定义音色，情感表达强 | 需要个性化音色、海外项目 |
 
@@ -124,7 +143,7 @@
 | SpeechBrain | Open Source VAD | https://github.com/speechbrain/speechbrain | 开源免费，支持自定义训练 | 成本敏感、有技术能力定制优化 |
 | Silero | Silero VAD | https://github.com/silero-vad/silero-vad | 轻量级，高准确率，完全免费开源 | 边缘部署、性能敏感场景 |
 
-**技术选型建议**：考虑到项目使用DeepSeek作为LLM后端，建议ASR和TTS优先选择国内服务商（阿里云或讯飞），以获得更好的中文效果和更低的网络延迟。VAD模块可考虑使用Silero等开源方案以降低成本。最终选型应根据项目的具体需求、预算限制、技术能力等因素综合考量。
+**技术选型建议**：本产品推荐采用**MiniMax全链路服务**，覆盖ASR语音识别、TTS语音合成、LLM大语言模型三大核心模块。MiniMax提供的端到端解决方案具有以下优势：统一的技术架构降低集成复杂度；原生支持中文场景效果最佳；高速推理能力满足实时对话需求；一站式服务简化运维管理。VAD模块推荐使用MiniMax VAD或Silero等开源方案。
 
 ### 3.3 智能指令过滤系统
 
