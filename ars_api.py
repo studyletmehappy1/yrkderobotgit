@@ -11,8 +11,8 @@ import json
 # ================= 百度短语音识别 API 配置 =================
 # 请前往百度智能云 (console.bce.baidu.com) -> 产品服务 -> 语音技术 -> 创建应用
 # 在应用列表可以获取以下两个 Key。个人认证每日免费额度足够普通测试。
-BAIDU_API_KEY = "填写你的_API_KEY_在这里"
-BAIDU_SECRET_KEY = "填写你的_SECRET_KEY_在这里"
+BAIDU_API_KEY = "填入你自己的百度云api"
+BAIDU_SECRET_KEY = "填入百度里面的secret_key"
 
 def recognize_baidu(audio):
     """调用百度短语音识别 REST API (纯PCM直传版本)"""
