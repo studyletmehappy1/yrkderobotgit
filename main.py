@@ -6,9 +6,18 @@ import tts_api
 def main():
     print("=== 正在启动智能管家（ASR -> LLM -> TTS）===")
     
-    # 设定管家的人设上下文
+    # 获取动态环境信息（当前北京时间和天气）
+    date_info, current_time, time_period = llm_Deepseek.get_current_time_info()
+    weather_info = llm_Deepseek.get_current_weather()
+    print(f"[系统] 当前时间: {date_info} {current_time}（{time_period}）")
+    print(f"[系统] 深圳天气: {weather_info}\n")
+    
+    # 生成动态系统提示词（包含实时时间和天气）
+    system_prompt = llm_Deepseek.create_system_prompt(date_info, current_time, time_period, weather_info)
+    
+    # 设定管家的人设上下文（现在包含动态时间信息）
     messages = [
-        {"role": "system", "content": "你是一位贴心且幽默的家庭智能管家。你的名字叫小爱。回答尽量口语化、简短，并适合语音播报。"}
+        {"role": "system", "content": system_prompt}
     ]
     
     print("\n💡 提示：运行过程中可按 Ctrl+C 退出程序。")
