@@ -3,7 +3,6 @@
 ASR 语音识别模块 (耳朵) - 实时识别版 (使用阿里云 NLS SDK)
 功能：调用本机/蓝牙麦克风录音 -> 实时流式识别 (SDK) -> 返回纯文本
 """
-
 import pyaudio
 import threading
 import queue

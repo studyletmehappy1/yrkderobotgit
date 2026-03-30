@@ -58,7 +58,7 @@ def get_current_weather():
 def call_deepseek_api(messages):
     """调用DeepSeek-V3.2 API"""
     api_url = "https://api.edgefn.net/v1/chat/completions"
-    api_key = "填入你自己的DeepSeek API Key"
+    api_key = "sk-ZqcUw3Viws3jvOOn6748A3C3719b4c18Ae26D1D7E1B87299"
     
     headers = {
         "Authorization": f"Bearer {api_key}",
