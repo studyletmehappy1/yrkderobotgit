@@ -1,125 +1,249 @@
 #!/usr/bin/env python3
 """
-ASR 语音识别模块 (耳朵)
-功能：调用本机/蓝牙麦克风录音 -> 自动截断 -> 调用免费 API -> 返回纯文本
+ASR 语音识别模块 (耳朵) - 实时识别版 (使用阿里云 NLS SDK)
+功能：调用本机/蓝牙麦克风录音 -> 实时流式识别 (SDK) -> 返回纯文本
 """
 
-import speech_recognition as sr
-import requests
-import json
+import pyaudio
+import threading
+import queue
+import time
+import nls # 导入阿里云 NLS SDK
 
-# ================= 百度短语音识别 API 配置 =================
-# 请前往百度智能云 (console.bce.baidu.com) -> 产品服务 -> 语音技术 -> 创建应用
-# 在应用列表可以获取以下两个 Key。个人认证每日免费额度足够普通测试。
-BAIDU_API_KEY = "填入你自己的百度云api"
-BAIDU_SECRET_KEY = "填入百度里面的secret_key"
+# ================= 阿里云实时语音识别 SDK 配置 =================
+# 请替换为你自己的阿里云账号信息
+APPKEY = "nmxAhyFvtY4dQHz0"  # 你的 AppKey
+TOKEN = "be4f563e545a4017aeca6e23ba68ed09"  # 你的 Access Token (请替换为实际获取的Token)
+# 如何获取Token: 参考 https://help.aliyun.com/zh/isi/getting-started/obtain-an-access-token
 
-def recognize_baidu(audio):
-    """调用百度短语音识别 REST API (纯PCM直传版本)"""
-    if BAIDU_API_KEY.startswith("填写你的"):
-        print("[耳朵] ❌ 请先在 ars_api.py 顶部填入你的百度 API_KEY 和 SECRET_KEY")
-        return ""
+# ================= 录音配置 =================
+# PyAudio 配置
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+RATE = 16000
+CHUNK = 6400  # 每次读取的帧数，6400帧约0.4秒 (16000hz * 0.4s)，适合流式发送
 
-    # 第一步：获取针对当前会话的 Access Token
-    token_url = f"https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials&client_id={BAIDU_API_KEY}&client_secret={BAIDU_SECRET_KEY}"
-    try:
-        token_response = requests.post(token_url, headers={'Content-Type': 'application/json'}, timeout=5)
-        token = token_response.json().get("access_token", "")
-        if not token:
-            print(f"[耳朵] ❌ 获取百度鉴权Token失败，请检查 Key 是否正确，或是否开通了语音技术服务。")
-            return ""
-    except Exception as e:
-        print(f"[耳朵] ❌ 请求百度鉴权接口网络异常: {e}")
-        return ""
-
-    # 第二步：将语音转码发给百度 ASR 识别服务器
-    # dev_pid=1537 代表普通话输入
-    asr_url = f"http://vop.baidu.com/server_api?dev_pid=1537&cuid=my_smart_home&token={token}"
-    
-    # 将录音数据转换为百度强制要求的标准格式数据：16kHz采样率, 16bit位深, 单声道, PCM编码
-    pcm_data = audio.get_raw_data(convert_rate=16000, convert_width=2)
-    
-    headers = {
-        'Content-Type': 'audio/pcm;rate=16000',
-        'Accept': 'application/json'
-    }
-    
-    try:
-        asr_response = requests.post(asr_url, headers=headers, data=pcm_data, timeout=10)
-        result = asr_response.json()
+class AliyunRealTimeASR_SDK:
+    def __init__(self):
+        self.appkey = APPKEY
+        self.token = TOKEN
+        self.url = "wss://nls-gateway-cn-shanghai.aliyuncs.com/ws/v1" # 默认上海节点
         
-        # 返回 JSON 中 err_no 为 0 代表识别成功
-        if result.get("err_no") == 0:
-            return result.get("result", [""])[0] 
-        else:
-            print(f"[耳朵] ❌ 百度识别出错 (错误码:{result.get('err_no')}): {result.get('err_msg')}")
+        self.audio_queue = queue.Queue()
+        self.result_queue = queue.Queue()
+        self.is_listening = False
+        self.is_recording = False
+        self.stream = None
+        self.pyaudio_instance = None
+        self.transcriber = None # SDK 实例
+
+    def _on_start(self, message, *args):
+        print(f"[ASR SDK] 连接已就绪: {message}")
+
+    def _on_sentence_begin(self, message, *args):
+        print("[ASR SDK] 检测到语音开始。")
+
+    def _on_sentence_end(self, message, *args):
+        print("[ASR SDK] 检测到语音结束。")
+
+    def _on_result_changed(self, message, *args):
+        # 实时显示中间结果
+        print(f"[ASR SDK] 🔄 识别中: {message}", end='\r')
+
+    def _on_completed(self, message, *args):
+        print(f"\n[ASR SDK] 识别完成: {message}")
+        try:
+            import json
+            # 假设 message 是 JSON 字符串，提取 result
+            data = json.loads(message)
+            result_text = data.get("payload", {}).get("result", "")
+            print(f"[ASR SDK] ✅ 最终识别结果: {result_text}")
+            self.result_queue.put(result_text)
+        except json.JSONDecodeError:
+            print("[ASR SDK] 解析最终结果失败，返回原始消息。")
+            self.result_queue.put(message)
+        except Exception as e:
+            print(f"[ASR SDK] 处理最终结果时出错: {e}")
+            self.result_queue.put("")
+        finally:
+            self.stop_listening()
+
+    def _on_error(self, message, *args):
+        print(f"[ASR SDK] 出现错误: {message}, args: {args}")
+        self.result_queue.put(None) # 发送错误信号
+        self.stop_listening()
+
+    def _on_close(self, *args):
+        print("[ASR SDK] WebSocket 连接已关闭。")
+
+    def start_listening(self):
+        """启动录音和SDK连接"""
+        if self.is_listening:
+            print("[ASR SDK] 正在监听中，请勿重复启动。")
+            return
+
+        print("\n[ASR SDK] 🎤 正在启动实时语音识别 (SDK)...")
+        
+        # 检查Token是否已配置
+        if self.token == "YOUR_TOKEN_HERE":
+            print("[ASR SDK] ❌ 请先在 ars_api.py 顶部填入你的阿里云 TOKEN。")
+            print("[ASR SDK]     请参考文档获取TOKEN: https://help.aliyun.com/zh/isi/getting-started/obtain-an-access-token")
+            return
+
+        self.is_listening = True
+        
+        # 1. 初始化SDK实例
+        try:
+            self.transcriber = nls.NlsSpeechTranscriber(
+                url=self.url,
+                token=self.token,
+                appkey=self.appkey,
+                on_start=self._on_start,
+                on_sentence_begin=self._on_sentence_begin,
+                on_sentence_end=self._on_sentence_end,
+                on_result_changed=self._on_result_changed,
+                on_completed=self._on_completed,
+                on_error=self._on_error,
+                on_close=self._on_close,
+                callback_args=[]
+            )
+        except Exception as e:
+            print(f"[ASR SDK] 初始化 SDK 失败: {e}")
+            self.is_listening = False
+            return
+
+        # 2. 启动SDK连接
+        try:
+            success = self.transcriber.start(
+                aformat="pcm", # 音频格式
+                sample_rate=RATE, # 采样率
+                ch=CHANNELS, # 声道数
+                enable_intermediate_result=True, # 开启中间结果
+                enable_punctuation_prediction=True, # 开启标点预测
+                enable_inverse_text_normalization=True # 开启ITN
+            )
+            if not success:
+                print("[ASR SDK] 启动识别会话失败。")
+                self.is_listening = False
+                return
+        except Exception as e:
+            print(f"[ASR SDK] 启动识别会话时出错: {e}")
+            self.is_listening = False
+            return
+
+        # 3. 初始化PyAudio录音
+        try:
+            self.pyaudio_instance = pyaudio.PyAudio()
+            self.stream = self.pyaudio_instance.open(
+                format=FORMAT,
+                channels=CHANNELS,
+                rate=RATE,
+                input=True,
+                frames_per_buffer=CHUNK
+            )
+        except Exception as e:
+            print(f"[ASR SDK] 初始化录音失败: {e}")
+            self.transcriber.shutdown() # 启动失败也要关闭SDK
+            self.is_listening = False
+            return
+
+        self.is_recording = True
+        print("[ASR SDK] 🟢 开始录音！请说话...")
+
+        # 4. 启动录音线程
+        record_thread = threading.Thread(target=self._record_and_send_audio)
+        record_thread.daemon = True
+        record_thread.start()
+
+    def _record_and_send_audio(self):
+        """内部录音函数，将音频数据读取并发送给SDK"""
+        while self.is_recording:
+            try:
+                # 从麦克风读取音频数据
+                data = self.stream.read(CHUNK, exception_on_overflow=False)
+                # 将音频数据发送给SDK
+                if not self.transcriber.send_audio(data):
+                    print("[ASR SDK] 发送音频数据失败，停止录音。")
+                    self.is_recording = False
+                    break
+            except Exception as e:
+                print(f"[ASR SDK] 录音或发送数据时出错: {e}")
+                self.is_recording = False
+                break
+
+    def stop_listening(self):
+        """停止录音和SDK连接"""
+        if not self.is_listening:
+            return
+            
+        print("\n[ASR SDK] 🛑 停止录音和识别...")
+        self.is_recording = False
+        self.is_listening = False
+        
+        # 停止录音流
+        if self.stream:
+            self.stream.stop_stream()
+            self.stream.close()
+        if self.pyaudio_instance:
+            self.pyaudio_instance.terminate()
+        
+        # 停止SDK识别 (这会触发 on_completed 或 on_error)
+        if self.transcriber:
+            try:
+                # 使用 stop 会等待服务端最终结果返回
+                # self.transcriber.stop(timeout=10) 
+                # 使用 shutdown 强行关闭连接，适用于我们等待队列的逻辑
+                self.transcriber.shutdown()
+            except Exception as e:
+                print(f"[ASR SDK] 关闭 transcriber 时出错: {e}")
+
+    def get_result(self):
+        """获取识别结果，阻塞直到有结果或连接关闭"""
+        try:
+            result = self.result_queue.get(timeout=30) # 设置30秒超时
+            return result if result is not None else ""
+        except queue.Empty:
+            print("[ASR SDK] ⚠️ 获取识别结果超时。")
             return ""
-    except Exception as e:
-        print(f"[耳朵] ❌ 请求百度ASR接口网络异常: {e}")
-        return ""
 
 def listen_and_recognize():
     """
     监听麦克风并返回识别到的文本。
+    这个函数与 main.py 的调用方式完全兼容。
     """
-    # 初始化语音识别器
-    recognizer = sr.Recognizer()
-
-    # sr.Microphone() 会自动抓取 Windows 系统的“默认录音设备”
-    # 只要连了蓝牙耳机并设为默认，这里就会自动通过蓝牙收音
-    with sr.Microphone() as source:
-        print("\n[耳朵] 🎤 正在校准环境底噪，请保持安静 1 秒钟...")
-        # 自动适应当前环境底噪，防止把风扇声当成说话声
-        recognizer.adjust_for_ambient_noise(source, duration=1.0)
+    asr_engine = AliyunRealTimeASR_SDK()
+    
+    try:
+        asr_engine.start_listening()
+        # 等待识别结果
+        text = asr_engine.get_result()
         
-        print("[耳朵] 🟢 校准完成！主人，我在听，请说话...")
-        try:
-            # 开始录音：
-            # timeout=5: 如果 5 秒内没检测到说话的声音，就放弃
-            # phrase_time_limit=15: 限制一句话最多录 15 秒，防止一直录下去
-            audio = recognizer.listen(source, timeout=5, phrase_time_limit=15)
-            
-            print("[耳朵] ⏳ 录音结束，正在请求云端翻译...")
-            
-            text = ""
-            
-            # 策略：双端降级容灾机制
-            # 优先尝试免费且带强力自适应的 Google API (需要网络环境允许)
-            try:
-                print("[耳朵] 正在尝试连接 Google ASR...")
-                text = recognizer.recognize_google(audio, language='zh-CN')
-            except Exception as e:
-                print(f"[耳朵] ⚠️ Google API 访问失败 ({e})，立即切换至百度国内通道...")
-                text = ""
-            
-            # 如果 Google 失败或者返回空，作为备用退线路由，启用百度 ASR
-            if not text:
-                print("[耳朵] 正在使用百度 ASR 兜底识别...")
-                text = recognize_baidu(audio)
-            
-            if text:
-                print(f"[耳朵] ✅ 听懂了: {text}")
-                return text
-            else:
-                return ""
-            
-        except sr.WaitTimeoutError:
-            print("[耳朵] ⚠️ 等了半天没听到声音哦。")
-            return ""
-        except sr.UnknownValueError:
-            print("[耳朵] ❓ 刚才的话没听清或者只有杂音，能再说一遍吗？")
-            return ""
-        except sr.RequestError as e:
-            print(f"[耳朵] ❌ 网络请求失败，请检查网络是否通畅: {e}")
-            return ""
-        except Exception as e:
-            print(f"[耳朵] ❌ 发生未知错误: {e}")
-            return ""
+        if text:
+            print(f"[ASR SDK] ✅ 识别成功: {text}")
+        else:
+            print("[ASR SDK] ❌ 识别失败或超时。")
+        
+        return text
+    
+    except KeyboardInterrupt:
+        print("\n[ASR SDK] 识别被用户中断。")
+        asr_engine.stop_listening()
+        return ""
+    except Exception as e:
+        print(f"[ASR SDK] 发生未知错误: {e}")
+        asr_engine.stop_listening()
+        return ""
+    finally:
+        # 确保资源被清理
+        asr_engine.stop_listening()
+
 
 # ========== 独立测试模块 ==========
 if __name__ == "__main__":
-    print("=== ASR 模块独立测试 ===")
-    print("提示：如果你戴着蓝牙耳机，请确保它是 Windows 默认录音设备。")
+    print("=== ASR SDK 实时识别模块独立测试 ===")
+    print("提示：请先配置好阿里云 TOKEN。")
+    print("提示：说话结束后，等待几秒钟以接收最终识别结果。")
+    
     result = listen_and_recognize()
     if result:
         print(f"\n最终返回给大模型的数据: '{result}'")
