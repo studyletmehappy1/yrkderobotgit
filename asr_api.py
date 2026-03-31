@@ -1,249 +1,223 @@
 #!/usr/bin/env python3
 """
-ASR 语音识别模块 (耳朵) - 实时识别版 (使用阿里云 NLS SDK)
-功能：调用本机/蓝牙麦克风录音 -> 实时流式识别 (SDK) -> 返回纯文本
+ASR 语音识别模块 (耳朵) - 究极后台打断版 (VAD + 阿里云 NLS SDK)
+功能：后台常驻静默监听 -> VAD秒级响应 -> 拉响打断警报 -> 连线阿里云 -> 返回识别文本
 """
+
 import pyaudio
 import threading
 import queue
 import time
-import nls # 导入阿里云 NLS SDK
+import json
+import nls
+import os
+import numpy as np
+import torch
+import atexit
 
 # ================= 阿里云实时语音识别 SDK 配置 =================
-# 请替换为你自己的阿里云账号信息
 APPKEY = "nmxAhyFvtY4dQHz0"  # 你的 AppKey
-TOKEN = "be4f563e545a4017aeca6e23ba68ed09"  # 你的 Access Token (请替换为实际获取的Token)
-# 如何获取Token: 参考 https://help.aliyun.com/zh/isi/getting-started/obtain-an-access-token
+TOKEN = "be4f563e545a4017aeca6e23ba68ed09"  # 你的 Access Token (务必确保是最新的)
 
-# ================= 录音配置 =================
-# PyAudio 配置
+# ================= 录音与 VAD 配置 =================
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
-CHUNK = 6400  # 每次读取的帧数，6400帧约0.4秒 (16000hz * 0.4s)，适合流式发送
+# 【关键修改】Silero VAD 强制要求帧数必须是 512, 1024, 或 1536
+CHUNK = 1536
+
+# --- 全局单例与通信枢纽 ---
+_asr_singleton = None
+_asr_lock = threading.Lock()
+_recognition_results = queue.Queue(maxsize=10) # 存放最终识别的句子
+
+# 【核心：打断警报器】专门用来通知主线程和 TTS 停止播放
+interrupt_flag = threading.Event()
+
+def get_global_asr_engine():
+    """获取全局唯一的 ASR 引擎实例，并启动后台监听"""
+    global _asr_singleton
+    with _asr_lock:
+        if _asr_singleton is None:
+            _asr_singleton = SileroVADRealTimeASR_Background()
+            _asr_singleton.start_listening_in_background()
+            atexit.register(stop_global_asr_engine)
+        return _asr_singleton
+
+def stop_global_asr_engine():
+    """程序退出时释放资源"""
+    global _asr_singleton
+    if _asr_singleton:
+        _asr_singleton.stop_listening()
+        _asr_singleton = None
+
+class SileroVAD:
+    """本地语音活动检测器（纯 JIT 模式）。"""
+    def __init__(self, threshold=0.5, model_path="silero_vad.jit"):
+        self.threshold = threshold
+        self.model = None
+
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        jit_abs = model_path if os.path.isabs(model_path) else os.path.join(base_dir, model_path)
+
+        print(f"[VAD] 正在从本地加载离线 JIT 模型: {jit_abs}")
+
+        if not os.path.exists(jit_abs):
+            raise FileNotFoundError(
+                "❌ 找不到 silero_vad.jit。请下载后放到项目根目录，"
+                "或在 SileroVAD(model_path=...) 里传入绝对路径。"
+            )
+
+        self.model = torch.jit.load(jit_abs, map_location="cpu")
+        self.model.eval()
+        torch.set_num_threads(1)
+
+    def is_speech(self, audio_chunk_bytes):
+        audio_int16 = np.frombuffer(audio_chunk_bytes, dtype=np.int16)
+        audio_float32 = audio_int16.astype(np.float32) / 32768.0
+        tensor_chunk = torch.from_numpy(audio_float32)
+        return self.model(tensor_chunk, RATE).item() > self.threshold
 
 class AliyunRealTimeASR_SDK:
-    def __init__(self):
+    """阿里云连接器 (只负责把 VAD 喂过来的声音发上云)"""
+    def __init__(self, result_callback):
         self.appkey = APPKEY
         self.token = TOKEN
-        self.url = "wss://nls-gateway-cn-shanghai.aliyuncs.com/ws/v1" # 默认上海节点
-        
-        self.audio_queue = queue.Queue()
-        self.result_queue = queue.Queue()
-        self.is_listening = False
-        self.is_recording = False
-        self.stream = None
-        self.pyaudio_instance = None
-        self.transcriber = None # SDK 实例
-
-    def _on_start(self, message, *args):
-        print(f"[ASR SDK] 连接已就绪: {message}")
-
-    def _on_sentence_begin(self, message, *args):
-        print("[ASR SDK] 检测到语音开始。")
-
-    def _on_sentence_end(self, message, *args):
-        print("[ASR SDK] 检测到语音结束。")
+        self.url = "wss://nls-gateway-cn-shanghai.aliyuncs.com/ws/v1"
+        self.result_callback = result_callback
+        self.transcriber = None
 
     def _on_result_changed(self, message, *args):
-        # 实时显示中间结果
-        print(f"[ASR SDK] 🔄 识别中: {message}", end='\r')
+        pass # 屏蔽中间结果疯狂刷屏，保持控制台清爽
 
     def _on_completed(self, message, *args):
-        print(f"\n[ASR SDK] 识别完成: {message}")
         try:
-            import json
-            # 假设 message 是 JSON 字符串，提取 result
             data = json.loads(message)
             result_text = data.get("payload", {}).get("result", "")
-            print(f"[ASR SDK] ✅ 最终识别结果: {result_text}")
-            self.result_queue.put(result_text)
-        except json.JSONDecodeError:
-            print("[ASR SDK] 解析最终结果失败，返回原始消息。")
-            self.result_queue.put(message)
-        except Exception as e:
-            print(f"[ASR SDK] 处理最终结果时出错: {e}")
-            self.result_queue.put("")
-        finally:
-            self.stop_listening()
+            self.result_callback(result_text)
+        except:
+            self.result_callback("")
 
     def _on_error(self, message, *args):
-        print(f"[ASR SDK] 出现错误: {message}, args: {args}")
-        self.result_queue.put(None) # 发送错误信号
-        self.stop_listening()
+        print(f"\n[阿里云] ❌ 出现错误: {message}")
+        self.result_callback("")
 
-    def _on_close(self, *args):
-        print("[ASR SDK] WebSocket 连接已关闭。")
+    def start_connection(self):
+        self.transcriber = nls.NlsSpeechTranscriber(
+            url=self.url, token=self.token, appkey=self.appkey,
+            on_result_changed=self._on_result_changed,
+            on_completed=self._on_completed, on_error=self._on_error,
+            callback_args=[]
+        )
+        self.transcriber.start(
+            aformat="pcm", sample_rate=RATE, ch=CHANNELS,
+            enable_intermediate_result=True,
+            enable_punctuation_prediction=True,
+            enable_inverse_text_normalization=True
+        )
 
-    def start_listening(self):
-        """启动录音和SDK连接"""
-        if self.is_listening:
-            print("[ASR SDK] 正在监听中，请勿重复启动。")
-            return
+    def send_audio(self, data):
+        if self.transcriber:
+            self.transcriber.send_audio(data)
 
-        print("\n[ASR SDK] 🎤 正在启动实时语音识别 (SDK)...")
-        
-        # 检查Token是否已配置
-        if self.token == "YOUR_TOKEN_HERE":
-            print("[ASR SDK] ❌ 请先在 ars_api.py 顶部填入你的阿里云 TOKEN。")
-            print("[ASR SDK]     请参考文档获取TOKEN: https://help.aliyun.com/zh/isi/getting-started/obtain-an-access-token")
-            return
+    def stop_connection(self):
+        if self.transcriber:
+            self.transcriber.stop()
+            self.transcriber.shutdown()
 
-        self.is_listening = True
-        
-        # 1. 初始化SDK实例
-        try:
-            self.transcriber = nls.NlsSpeechTranscriber(
-                url=self.url,
-                token=self.token,
-                appkey=self.appkey,
-                on_start=self._on_start,
-                on_sentence_begin=self._on_sentence_begin,
-                on_sentence_end=self._on_sentence_end,
-                on_result_changed=self._on_result_changed,
-                on_completed=self._on_completed,
-                on_error=self._on_error,
-                on_close=self._on_close,
-                callback_args=[]
-            )
-        except Exception as e:
-            print(f"[ASR SDK] 初始化 SDK 失败: {e}")
-            self.is_listening = False
-            return
+class SileroVADRealTimeASR_Background:
+    """后台监听器类"""
+    def __init__(self):
+        self.is_listening = False
+        self.background_thread = None
+        self.vad_detector = None
+        self.stream = None
+        self.pyaudio_instance = None
+        self.current_asr_engine = None
 
-        # 2. 启动SDK连接
-        try:
-            success = self.transcriber.start(
-                aformat="pcm", # 音频格式
-                sample_rate=RATE, # 采样率
-                ch=CHANNELS, # 声道数
-                enable_intermediate_result=True, # 开启中间结果
-                enable_punctuation_prediction=True, # 开启标点预测
-                enable_inverse_text_normalization=True # 开启ITN
-            )
-            if not success:
-                print("[ASR SDK] 启动识别会话失败。")
-                self.is_listening = False
-                return
-        except Exception as e:
-            print(f"[ASR SDK] 启动识别会话时出错: {e}")
-            self.is_listening = False
-            return
-
-        # 3. 初始化PyAudio录音
-        try:
-            self.pyaudio_instance = pyaudio.PyAudio()
-            self.stream = self.pyaudio_instance.open(
-                format=FORMAT,
-                channels=CHANNELS,
-                rate=RATE,
-                input=True,
-                frames_per_buffer=CHUNK
-            )
-        except Exception as e:
-            print(f"[ASR SDK] 初始化录音失败: {e}")
-            self.transcriber.shutdown() # 启动失败也要关闭SDK
-            self.is_listening = False
-            return
-
-        self.is_recording = True
-        print("[ASR SDK] 🟢 开始录音！请说话...")
-
-        # 4. 启动录音线程
-        record_thread = threading.Thread(target=self._record_and_send_audio)
-        record_thread.daemon = True
-        record_thread.start()
-
-    def _record_and_send_audio(self):
-        """内部录音函数，将音频数据读取并发送给SDK"""
-        while self.is_recording:
+    def _process_recognition_result(self, text):
+        if text.strip():
+            print(f"\n[ASR 后台] ✅ 最终听懂: {text}")
             try:
-                # 从麦克风读取音频数据
-                data = self.stream.read(CHUNK, exception_on_overflow=False)
-                # 将音频数据发送给SDK
-                if not self.transcriber.send_audio(data):
-                    print("[ASR SDK] 发送音频数据失败，停止录音。")
-                    self.is_recording = False
-                    break
-            except Exception as e:
-                print(f"[ASR SDK] 录音或发送数据时出错: {e}")
-                self.is_recording = False
-                break
+                _recognition_results.put_nowait(text)
+            except queue.Full:
+                pass
+
+    def start_listening_in_background(self):
+        if self.is_listening: return
+        self.is_listening = True
+        self.vad_detector = SileroVAD(threshold=0.5)
+        self.background_thread = threading.Thread(target=self._run_vad_detection_loop, daemon=True)
+        self.background_thread.start()
+
+    def _run_vad_detection_loop(self):
+        self.pyaudio_instance = pyaudio.PyAudio()
+        self.stream = self.pyaudio_instance.open(
+            format=FORMAT, channels=CHANNELS, rate=RATE,
+            input=True, frames_per_buffer=CHUNK
+        )
+        print("[ASR 后台] 🟢 麦克风已开启，7x24小时全天候静默监听...")
+
+        state = "WAITING"
+        silence_chunks = 0
+        max_silence_chunks = 10 # 约1秒静音判定为说完了一句话
+
+        try:
+            while self.is_listening:
+                audio_data = self.stream.read(CHUNK, exception_on_overflow=False)
+                has_speech = self.vad_detector.is_speech(audio_data)
+
+                if state == "WAITING":
+                    if has_speech:
+                        # ⚡⚡⚡ 究极核心：听到人声的瞬间，拉响打断警报！通知 TTS 闭嘴！
+                        interrupt_flag.set()
+                        print("\n[VAD] ⚡ 检测到人声！警报已拉响！连线阿里云...")
+                        self.current_asr_engine = AliyunRealTimeASR_SDK(self._process_recognition_result)
+                        self.current_asr_engine.start_connection()
+                        self.current_asr_engine.send_audio(audio_data)
+                        state = "RECORDING"
+                        silence_chunks = 0
+
+                elif state == "RECORDING":
+                    self.current_asr_engine.send_audio(audio_data)
+                    
+                    if not has_speech:
+                        silence_chunks += 1
+                    else:
+                        silence_chunks = 0
+
+                    # 连续1秒没有声音，判定说话结束
+                    if silence_chunks > max_silence_chunks:
+                        print("[VAD] 🛑 判定说话结束！立刻切断录音。")
+                        self.current_asr_engine.stop_connection()
+                        self.current_asr_engine = None
+                        state = "WAITING"
+                        silence_chunks = 0
+                        
+        except Exception as e:
+            print(f"[ASR 后台] 发生异常: {e}")
+        finally:
+            if self.stream:
+                self.stream.stop_stream()
+                self.stream.close()
+            if self.pyaudio_instance:
+                self.pyaudio_instance.terminate()
 
     def stop_listening(self):
-        """停止录音和SDK连接"""
-        if not self.is_listening:
-            return
-            
-        print("\n[ASR SDK] 🛑 停止录音和识别...")
-        self.is_recording = False
         self.is_listening = False
-        
-        # 停止录音流
-        if self.stream:
-            self.stream.stop_stream()
-            self.stream.close()
-        if self.pyaudio_instance:
-            self.pyaudio_instance.terminate()
-        
-        # 停止SDK识别 (这会触发 on_completed 或 on_error)
-        if self.transcriber:
-            try:
-                # 使用 stop 会等待服务端最终结果返回
-                # self.transcriber.stop(timeout=10) 
-                # 使用 shutdown 强行关闭连接，适用于我们等待队列的逻辑
-                self.transcriber.shutdown()
-            except Exception as e:
-                print(f"[ASR SDK] 关闭 transcriber 时出错: {e}")
 
-    def get_result(self):
-        """获取识别结果，阻塞直到有结果或连接关闭"""
-        try:
-            result = self.result_queue.get(timeout=30) # 设置30秒超时
-            return result if result is not None else ""
-        except queue.Empty:
-            print("[ASR SDK] ⚠️ 获取识别结果超时。")
-            return ""
-
+# ================= 核心接口：供 main.py 调用 =================
 def listen_and_recognize():
     """
-    监听麦克风并返回识别到的文本。
-    这个函数与 main.py 的调用方式完全兼容。
+    主程序获取文字的接口 (带 0.5 秒超时保护的阻塞获取)。
+    彻底解决了 while True 导致 CPU 100% 暴走的 Bug。
     """
-    asr_engine = AliyunRealTimeASR_SDK()
-    
-    try:
-        asr_engine.start_listening()
-        # 等待识别结果
-        text = asr_engine.get_result()
-        
-        if text:
-            print(f"[ASR SDK] ✅ 识别成功: {text}")
-        else:
-            print("[ASR SDK] ❌ 识别失败或超时。")
-        
-        return text
-    
-    except KeyboardInterrupt:
-        print("\n[ASR SDK] 识别被用户中断。")
-        asr_engine.stop_listening()
-        return ""
-    except Exception as e:
-        print(f"[ASR SDK] 发生未知错误: {e}")
-        asr_engine.stop_listening()
-        return ""
-    finally:
-        # 确保资源被清理
-        asr_engine.stop_listening()
-
-
-# ========== 独立测试模块 ==========
-if __name__ == "__main__":
-    print("=== ASR SDK 实时识别模块独立测试 ===")
-    print("提示：请先配置好阿里云 TOKEN。")
-    print("提示：说话结束后，等待几秒钟以接收最终识别结果。")
-    
-    result = listen_and_recognize()
-    if result:
-        print(f"\n最终返回给大模型的数据: '{result}'")
-    print("=== 测试结束 ===")
+    get_global_asr_engine() 
+    while True:
+        try:
+            # 阻塞等0.5秒，给了系统喘息的空间，也随时响应队列中的结果
+            text = _recognition_results.get(timeout=0.5)
+            return text
+        except queue.Empty:
+            # 没听到字就继续等，这样也允许你用 Ctrl+C 随时中断程序
+            continue

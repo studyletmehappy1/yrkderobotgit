@@ -24,6 +24,22 @@ class InputManager:
             "chunk": 1024,
         }
 
+    def start_background_listening(self):
+        """唤醒后台监听服务"""
+        if self.mode == 'asr':
+            asr_api.get_global_asr_engine()
+
+    def clear_interrupt(self):
+        """进入新的一轮前，清理打断警报"""
+        if self.mode == 'asr':
+            asr_api.interrupt_flag.clear()
+
+    def get_interrupt_flag(self):
+        """获取打断警报器标志，用于传给 TTS 模块"""
+        if self.mode == 'asr':
+            return asr_api.interrupt_flag
+        return None
+
     def get_user_input(self):
         """
         统一的获取用户输入的入口。
