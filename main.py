@@ -19,7 +19,7 @@ def main():
     ]
     
     # 1. 开启后台永远运行的耳朵
-    ars_api.start_background_listening()
+    asr_api.start_background_listening()
     
     print("\n💡 提示：运行过程中可按 Ctrl+C 退出程序。")
     print("当前状态：💤 待机中，请随时喊“小艺小艺”开始对话...\n")
