@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-ASR 语音识别模块 (耳朵) - 究极后台打断版 (VAD + 阿里云 NLS SDK)
-功能：后台常驻静默监听 -> VAD秒级响应 -> 拉响打断警报 -> 连线阿里云 -> 返回识别文本
+ASR 语音识别模块 (耳朵) - 阿里云+VAD状态机版
+功能：后台常驻静默监听 -> VAD秒级响应 -> 连线阿里云 -> 唤醒词判定 -> 触发打断
 """
 
 import pyaudio
 import threading
-import queue
 import time
 import json
 import nls
@@ -14,28 +13,24 @@ import os
 import numpy as np
 import torch
 import atexit
+import shared_state # 引入全局状态机
 
 # ================= 阿里云实时语音识别 SDK 配置 =================
-APPKEY = "nmxAhyFvtY4dQHz0"  # 你的 AppKey
-TOKEN = "be4f563e545a4017aeca6e23ba68ed09"  # 你的 Access Token (务必确保是最新的)
+APPKEY = "nmxAhyFvtY4dQHz0"  
+TOKEN = "be4f563e545a4017aeca6e23ba68ed09"  
 
 # ================= 录音与 VAD 配置 =================
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
-# 【关键修改】Silero VAD 强制要求帧数必须是 512, 1024, 或 1536
-CHUNK = 1536
+CHUNK = 512
 
-# --- 全局单例与通信枢纽 ---
+# --- 全局单例 ---
 _asr_singleton = None
 _asr_lock = threading.Lock()
-_recognition_results = queue.Queue(maxsize=10) # 存放最终识别的句子
 
-# 【核心：打断警报器】专门用来通知主线程和 TTS 停止播放
-interrupt_flag = threading.Event()
-
-def get_global_asr_engine():
-    """获取全局唯一的 ASR 引擎实例，并启动后台监听"""
+def start_background_listening():
+    """暴露给外部的启动接口 (供 main.py 调用)"""
     global _asr_singleton
     with _asr_lock:
         if _asr_singleton is None:
@@ -51,6 +46,7 @@ def stop_global_asr_engine():
         _asr_singleton.stop_listening()
         _asr_singleton = None
 
+
 class SileroVAD:
     """本地语音活动检测器（纯 JIT 模式）。"""
     def __init__(self, threshold=0.5, model_path="silero_vad.jit"):
@@ -64,8 +60,7 @@ class SileroVAD:
 
         if not os.path.exists(jit_abs):
             raise FileNotFoundError(
-                "❌ 找不到 silero_vad.jit。请下载后放到项目根目录，"
-                "或在 SileroVAD(model_path=...) 里传入绝对路径。"
+                "❌ 找不到 silero_vad.jit。请下载后放到项目根目录，或传入绝对路径。"
             )
 
         self.model = torch.jit.load(jit_abs, map_location="cpu")
@@ -78,8 +73,9 @@ class SileroVAD:
         tensor_chunk = torch.from_numpy(audio_float32)
         return self.model(tensor_chunk, RATE).item() > self.threshold
 
+
 class AliyunRealTimeASR_SDK:
-    """阿里云连接器 (只负责把 VAD 喂过来的声音发上云)"""
+    """阿里云连接器"""
     def __init__(self, result_callback):
         self.appkey = APPKEY
         self.token = TOKEN
@@ -88,9 +84,20 @@ class AliyunRealTimeASR_SDK:
         self.transcriber = None
 
     def _on_result_changed(self, message, *args):
-        pass # 屏蔽中间结果疯狂刷屏，保持控制台清爽
+        # ⚡ 究极优化：在阿里云返回中间结果时就进行实时检测，实现极低延迟打断！
+        try:
+            data = json.loads(message)
+            text = data.get("payload", {}).get("result", "")
+            # ✅ 修改点 1：将打断词改为“小艺小艺”
+            if "小艺小艺" in text and shared_state.current_state in [shared_state.RobotState.SPEAKING, shared_state.RobotState.THINKING]:
+                print("\n[系统] ⚡ (毫秒级响应) 听到唤醒词 '小艺小艺'！紧急刹车！")
+                shared_state.interrupt_flag = True
+                shared_state.current_state = shared_state.RobotState.LISTENING
+        except:
+            pass
 
     def _on_completed(self, message, *args):
+        # 完整句子识别结束
         try:
             data = json.loads(message)
             result_text = data.get("payload", {}).get("result", "")
@@ -99,7 +106,7 @@ class AliyunRealTimeASR_SDK:
             self.result_callback("")
 
     def _on_error(self, message, *args):
-        print(f"\n[阿里云] ❌ 出现错误: {message}")
+        # 屏蔽无关紧要的网络波动报错，保持清爽
         self.result_callback("")
 
     def start_connection(self):
@@ -111,7 +118,7 @@ class AliyunRealTimeASR_SDK:
         )
         self.transcriber.start(
             aformat="pcm", sample_rate=RATE, ch=CHANNELS,
-            enable_intermediate_result=True,
+            enable_intermediate_result=True,  # 必须设为 True 才能实时打断
             enable_punctuation_prediction=True,
             enable_inverse_text_normalization=True
         )
@@ -125,6 +132,7 @@ class AliyunRealTimeASR_SDK:
             self.transcriber.stop()
             self.transcriber.shutdown()
 
+
 class SileroVADRealTimeASR_Background:
     """后台监听器类"""
     def __init__(self):
@@ -136,12 +144,33 @@ class SileroVADRealTimeASR_Background:
         self.current_asr_engine = None
 
     def _process_recognition_result(self, text):
-        if text.strip():
-            print(f"\n[ASR 后台] ✅ 最终听懂: {text}")
-            try:
-                _recognition_results.put_nowait(text)
-            except queue.Full:
-                pass
+        if not text.strip(): return
+
+        print(f"\n[ASR 阿里云解析] {text}")
+
+        # ==== 核心：状态机与唤醒词过滤 ====
+        if shared_state.current_state in [shared_state.RobotState.SPEAKING, shared_state.RobotState.THINKING, shared_state.RobotState.IDLE]:
+            # ✅ 修改点 2：将唤醒词改为“小艺小艺”
+            if "小艺小艺" in text:
+                # 状态切换与打断标记 (如果在 _on_result_changed 里没触发，这里兜底)
+                if not shared_state.interrupt_flag:
+                    print(f"\n[系统] ⚡ 听到唤醒词 '小艺小艺'！强行打断！")
+                    shared_state.interrupt_flag = True
+                    shared_state.current_state = shared_state.RobotState.LISTENING
+                
+                # ✅ 修改点 3：裁剪文本时，把“小艺小艺”剔除掉，避免传给大模型变成复读机
+                command = text.replace("小艺小艺", "").replace("，", "").replace("。", "").strip()
+                if command:
+                    shared_state.text_queue.put(command)
+            else:
+                # 没听到小艺小艺，当作没听见（过滤掉环境音和机器人自己的声音）
+                pass 
+
+        elif shared_state.current_state == shared_state.RobotState.LISTENING:
+            print(f"[系统] ✅ 接收到有效指令，提交给大脑...")
+            shared_state.text_queue.put(text)
+            # 收音完毕，进入思考保护状态
+            shared_state.current_state = shared_state.RobotState.THINKING
 
     def start_listening_in_background(self):
         if self.is_listening: return
@@ -160,7 +189,7 @@ class SileroVADRealTimeASR_Background:
 
         state = "WAITING"
         silence_chunks = 0
-        max_silence_chunks = 10 # 约1秒静音判定为说完了一句话
+        max_silence_chunks = 10 
 
         try:
             while self.is_listening:
@@ -169,9 +198,6 @@ class SileroVADRealTimeASR_Background:
 
                 if state == "WAITING":
                     if has_speech:
-                        # ⚡⚡⚡ 究极核心：听到人声的瞬间，拉响打断警报！通知 TTS 闭嘴！
-                        interrupt_flag.set()
-                        print("\n[VAD] ⚡ 检测到人声！警报已拉响！连线阿里云...")
                         self.current_asr_engine = AliyunRealTimeASR_SDK(self._process_recognition_result)
                         self.current_asr_engine.start_connection()
                         self.current_asr_engine.send_audio(audio_data)
@@ -186,9 +212,7 @@ class SileroVADRealTimeASR_Background:
                     else:
                         silence_chunks = 0
 
-                    # 连续1秒没有声音，判定说话结束
                     if silence_chunks > max_silence_chunks:
-                        print("[VAD] 🛑 判定说话结束！立刻切断录音。")
                         self.current_asr_engine.stop_connection()
                         self.current_asr_engine = None
                         state = "WAITING"
@@ -205,19 +229,3 @@ class SileroVADRealTimeASR_Background:
 
     def stop_listening(self):
         self.is_listening = False
-
-# ================= 核心接口：供 main.py 调用 =================
-def listen_and_recognize():
-    """
-    主程序获取文字的接口 (带 0.5 秒超时保护的阻塞获取)。
-    彻底解决了 while True 导致 CPU 100% 暴走的 Bug。
-    """
-    get_global_asr_engine() 
-    while True:
-        try:
-            # 阻塞等0.5秒，给了系统喘息的空间，也随时响应队列中的结果
-            text = _recognition_results.get(timeout=0.5)
-            return text
-        except queue.Empty:
-            # 没听到字就继续等，这样也允许你用 Ctrl+C 随时中断程序
-            continue
